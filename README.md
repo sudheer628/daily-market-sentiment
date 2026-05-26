@@ -29,14 +29,21 @@ docker build -t daily-market-sentiment:latest .
 
 ## Local container test
 
+Create a local `.env` from `.env.example`, then run the container with your real values and Redis configuration:
+
 ```bash
-docker run --rm \
-  -e OUTPUT_BUCKET=my-bucket \
-  -e OUTPUT_PREFIX=daily-market-sentiment \
-  -e SERPER_API_KEY=YOUR_SERPER_KEY \
-  -e APIFY_TOKEN=YOUR_APIFY_TOKEN \
-  daily-market-sentiment:latest \
-  '{"task":"daily_batch"}'
+cp .env.example .env
+# edit .env to set REDIS_HOST, REDIS_PORT, REDIS_USERNAME, REDIS_PASSWORD, APIFY_TOKEN, OUTPUT_BUCKET, etc.
+
+docker run --rm --env-file .env -p 9000:8080 daily-market-sentiment:latest
+```
+
+Invoke the Lambda runtime API from another shell:
+
+```bash
+curl -s -XPOST "http://localhost:9000/2015-03-31/functions/function/invocations" \
+  -H "Content-Type: application/json" \
+  -d '{"task":"daily_batch"}'
 ```
 
 If you want to test only print output without S3 persistence, omit `OUTPUT_BUCKET` and the function will still run and emit the result to Lambda logs.
@@ -45,10 +52,12 @@ If you want to test only print output without S3 persistence, omit `OUTPUT_BUCKE
 
 - `OUTPUT_BUCKET` - optional S3 bucket for JSON result storage; if omitted, results are printed only
 - `OUTPUT_PREFIX` - optional S3 prefix (default: `daily-market-sentiment`)
-- `SERPER_API_KEY` - required for live news ingestion when `task` is `news` or `fetch_news`
 - `APIFY_TOKEN` - required for FII/DII fetch when `task` is `fii_dii` or `fetch_fii_dii`
 - `USE_MOCK` - optional, set `true` to run mock data instead of live APIs
 - `LOG_LEVEL` - optional logging level
+- `REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME`, `REDIS_PASSWORD` - Redis Cloud credentials used to fetch `SERPER_API_KEY` from the Redis key `serper_api_key`
+- `SERPER_API_KEY` - optional local fallback if Redis is unavailable; primary source is Redis Cloud
+- `SERPER_BASE_URL` - optional override for Serper endpoint
 
 ## Deployment outline
 
@@ -173,6 +182,26 @@ docker tag daily-market-sentiment:latest <account-id>.dkr.ecr.<aws-region>.amazo
 docker push <account-id>.dkr.ecr.<aws-region>.amazonaws.com/daily-market-sentiment:latest
 ```
 
+## Rebuild and redeploy after code changes
+
+If you make changes to the code, rebuild and replace the image in ECR with these steps:
+
+```bash
+# Remove the old local image
+docker image rm daily-market-sentiment:latest
+# or force remove if needed
+docker image rm -f daily-market-sentiment:latest
+
+# Rebuild the container image
+docker build -t daily-market-sentiment:latest .
+
+# Re-tag and push to ECR
+docker tag daily-market-sentiment:latest <account-id>.dkr.ecr.<aws-region>.amazonaws.com/daily-market-sentiment:latest
+docker push <account-id>.dkr.ecr.<aws-region>.amazonaws.com/daily-market-sentiment:latest
+```
+
+If you want to keep the previous image tag, use a versioned tag instead of `latest`, for example `daily-market-sentiment:v1.1.0`.
+
 Notes:
 - Prefer assigning an IAM role to the EC2 instance with `ecr:CreateRepository`, `ecr:UploadLayerPart`, `ecr:CompleteLayerUpload`, `ecr:BatchCheckLayerAvailability`, and `ecr:PutImage`, or configure `aws configure` with credentials.
 - Keep the EC2 builder ephemeral; remove images or terminate the instance after pushing to save cost.
@@ -182,12 +211,12 @@ Notes:
 This repo uses several runtime environment variables and third-party tokens. Do NOT commit secrets to the repository. Use one of the following secure options instead:
 
 - AWS Lambda environment variables (set in the Lambda console) for non-sensitive values and references
-- AWS Secrets Manager or AWS Systems Manager Parameter Store (SecureString) for API keys and tokens, then grant the Lambda role permissions to read them
+- A secure secret store or parameter store for API keys and tokens, then grant the Lambda role the minimum required permissions to read them
 - GitHub Actions secrets or other CI secrets for automated builds (do not write secrets into images)
 
 Primary variables used by the application:
 
-- `SERPER_API_KEY` — Serper news API key (required for `news` task)
+- `SERPER_API_KEY` — local fallback Serper news API key; primary source for production is Redis Cloud key `serper_api_key`
 - `SERPER_BASE_URL` — optional override for Serper endpoint
 - `APIFY_TOKEN` — primary Apify token for FII/DII dataset access (used by `fii_dii` task)
 - `APIFY_FII_DII_PRIMARY_DATASET_URL` — primary dataset URL (optional override)
@@ -199,20 +228,21 @@ Primary variables used by the application:
 
 Handling best-practices:
 
-- For Lambda: store `SERPER_API_KEY` and `APIFY_TOKEN` in AWS Secrets Manager and set a small wrapper in Lambda to read them at cold-start (or use IAM role attached to Lambda with permission to get the secrets). Do not bake secrets into container images.
+- For Lambda: keep secrets and API keys out of images. Use environment variables or a secure secret store and attach an IAM role that permits only the required AWS actions.
+- For Redis Cloud: set `REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME`, `REDIS_PASSWORD` in your Lambda environment to allow the application to read `SERPER_API_KEY` from Redis.
 - If you must test locally on EC2, create a `.env` file from `.env.example` and keep it out of git (`.gitignore` already configured). Example `.env` usage is provided for local testing only.
-- For CI/CD: use GitHub Secrets to store `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` for a short-lived workflow or prefer using GitHub Actions OIDC + role assumption to avoid long-lived credentials.
+- For CI/CD: use GitHub Secrets or OIDC role assumption to avoid long-lived credentials.
 
 Example: safely reading secrets in Lambda
 
-1. Store `SERPER_API_KEY` in AWS Secrets Manager as `daily-market-sentiment/serper`.
-2. Add `secrets:arn:aws:secretsmanager:<region>:<acct>:secret:daily-market-sentiment/serper` permission to Lambda role.
-3. In the Lambda environment set a variable `SERPER_SECRET_ARN` pointing to the secret ARN and read it at startup.
+1. Store `SERPER_API_KEY` in a secure secret or parameter store.
+2. Grant the Lambda role permission to read only the specific secret.
+3. In the Lambda environment, configure a variable that points to the secret location and load it at startup.
 
 ## Quick checklist before production cutover
 
 - Build and push latest image to ECR from EC2.
-- Create Lambda function using the ECR image and attach IAM role with S3 write and Secrets Manager read permissions.
-- Populate Lambda environment variables or mount secrets as described.
+- Create Lambda function using the ECR image and attach an IAM role with S3 write and secret read permissions.
+- Populate Lambda environment variables or configure secure secret access as described.
 - Create EventBridge rules for weekday triggers (see above cron expressions).
 - Monitor the first few runs via CloudWatch Logs and ensure JSON artifacts appear in S3 (if configured).
