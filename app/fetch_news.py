@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import requests
+import redis
 from dateutil.parser import parse as parse_date
 
 logger = logging.getLogger("daily_market_sentiment.fetch_news")
@@ -31,10 +32,50 @@ class SerperNewsFetcher:
             "US Fed policy India",
             "risk sentiment emerging markets",
         ],
+        # High-signal pre-market queries (overnight / pre-open signals)
+        "market_sentiment": [
+            "US market close impact on Indian market today",
+            "GIFT Nifty pre-market indication India today",
+            "crude oil and USDINR impact on Indian markets today",
+        ],
     }
 
     def __init__(self, api_key: Optional[str] = None, max_age_hours: int = 12):
+        # Attempt to read Serper API key from Redis first (key: 'serper_api_key'),
+        # then fall back to environment variable `SERPER_API_KEY`.
         self.api_key = api_key or os.getenv("SERPER_API_KEY", "")
+
+        def _get_redis_client():
+            # Mirror market_signal_agent.get_redis_client behavior using REDIS_HOST/REDIS_PORT.
+            # Redis Cloud setup generally provides host, port, username, and password.
+            try:
+                host = os.getenv("REDIS_HOST")
+                port = os.getenv("REDIS_PORT")
+                if not host or not port:
+                    return None
+
+                return redis.Redis(
+                    host=host,
+                    port=int(port),
+                    username=os.getenv("REDIS_USERNAME") or None,
+                    password=os.getenv("REDIS_PASSWORD") or None,
+                    decode_responses=True,
+                    socket_timeout=10,
+                )
+            except Exception:
+                logger.exception("Failed to create Redis client")
+                return None
+
+        try:
+            if not self.api_key:
+                rc = _get_redis_client()
+                if rc:
+                    val = rc.get("serper_api_key")
+                    if val:
+                        self.api_key = val
+                        logger.info("Loaded SERPER API key from Redis")
+        except Exception:
+            logger.exception("Failed to read SERPER API key from Redis; falling back to environment variable.")
         self.base_url = os.getenv("SERPER_BASE_URL", "https://google.serper.dev/news")
         self.max_age_hours = max_age_hours
         self.today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -146,9 +187,12 @@ class SerperNewsFetcher:
 
     def fetch_market_drivers(self) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
+        # Iterate through curated queries; include a small number of
+        # high-signal additional queries to capture market sentiment.
         for category, queries in self.BASE_QUERIES.items():
             for query in queries:
                 results.extend(self.fetch_news(query, num_results=6))
+        return results
         return results
 
 

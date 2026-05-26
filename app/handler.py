@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from .fetch_fii_dii import FiiDiiJob
 from .fetch_news import MarketNewsJob
 from .storage import S3Storage
+from .emailer import send_email
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -86,6 +87,21 @@ def lambda_handler(event, context):
         results["status"] = "success"
         logger.info("Lambda completed successfully")
         print("Lambda execution finished successfully")
+
+        # Send an email summary if email env vars are configured
+        try:
+            subject = f"daily-market-sentiment: {task} completed {results['status']}"
+            body_lines = [f"Task: {task}", f"Status: {results['status']}", f"Timestamp: {results['timestamp']}", "Outputs:"]
+            for out in results.get("outputs", []):
+                body_lines.append(str(out))
+            body = "\n".join(body_lines)
+            sent = send_email(subject, body)
+            if sent:
+                print("Notification email sent")
+            else:
+                print("Notification email not sent (missing config or failed)")
+        except Exception:
+            logger.exception("Failed to send notification email")
     except Exception as exc:
         logger.exception("Lambda execution failed")
         results["status"] = "failure"
